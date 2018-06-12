@@ -10,7 +10,20 @@ from rlkit.core.eval_util import create_stats_ordered_dict
 from rlkit.torch.torch_rl_algorithm import TorchRLAlgorithm
 
 
-class TD3(TorchRLAlgorithm):
+import abc
+import pickle
+import time
+
+import gtimer as gt
+import numpy as np
+
+from rlkit.core import logger
+from rlkit.data_management.env_replay_buffer import EnvReplayBuffer
+from rlkit.data_management.path_builder import PathBuilder
+from rlkit.policies.base import ExplorationPolicy
+from rlkit.samplers.in_place import InPlacePathSampler
+
+class EnsembleTD3(TorchRLAlgorithm):
     """
     Twin Delayed Deep Deterministic policy gradients
 
@@ -20,8 +33,7 @@ class TD3(TorchRLAlgorithm):
     def __init__(
             self,
             env,
-            qf1,
-            qf2,
+            qfs,
             policy,
             exploration_policy,
 
@@ -46,8 +58,7 @@ class TD3(TorchRLAlgorithm):
         )
         if qf_criterion is None:
             qf_criterion = nn.MSELoss()
-        self.qf1 = qf1
-        self.qf2 = qf2
+        self.qfs = qfs
         self.policy = policy
 
         self.target_policy_noise = target_policy_noise
@@ -59,16 +70,16 @@ class TD3(TorchRLAlgorithm):
         self.qf_criterion = qf_criterion
 
         self.target_policy = policy.copy()
-        self.target_qf1 = self.qf1.copy()
-        self.target_qf2 = self.qf2.copy()
-        self.qf1_optimizer = optimizer_class(
-            self.qf1.parameters(),
+
+        self.num_q = len(qfs)
+
+        self.target_qfs = [qf.copy() for qf in self.qfs ]
+
+        self.qf_optimizers = [optimizer_class(
+            qf.parameters(),
             lr=qf_learning_rate,
-        )
-        self.qf2_optimizer = optimizer_class(
-            self.qf2.parameters(),
-            lr=qf_learning_rate,
-        )
+        ) for qf in self.qfs]
+
         self.policy_optimizer = optimizer_class(
             self.policy.parameters(),
             lr=policy_learning_rate,
@@ -99,52 +110,75 @@ class TD3(TorchRLAlgorithm):
         )
         noisy_next_actions = next_actions + noise
 
-        target_q1_values = self.target_qf1(next_obs, noisy_next_actions)
-        target_q2_values = self.target_qf2(next_obs, noisy_next_actions)
-        target_q_values = torch.min(target_q1_values, target_q2_values)
-        q_target = rewards + (1. - terminals) * self.discount * target_q_values
-        q_target = q_target.detach()
 
-        q1_pred = self.qf1(obs, actions)
-        bellman_errors_1 = (q1_pred - q_target) ** 2
-        qf1_loss = bellman_errors_1.mean()
-
-        q2_pred = self.qf2(obs, actions)
-        bellman_errors_2 = (q2_pred - q_target) ** 2
-        qf2_loss = bellman_errors_2.mean()
+        bellman_errors = []
+        for idx in range(self.num_q):
+            target_q_values = self.target_qfs[idx](next_obs, noisy_next_actions)
+            q_target = rewards + (1. - terminals) * self.discount * target_q_values
+            q_target = q_target.detach()
+            q_pred = self.qfs[idx](obs, actions)
+            bellman_errors.append( (q_pred - q_target) ** 2)
 
         """
         Update Networks
         """
-        self.qf1_optimizer.zero_grad()
-        qf1_loss.backward()
-        self.qf1_optimizer.step()
-
-        self.qf2_optimizer.zero_grad()
-        qf2_loss.backward()
-
-        self.qf2_optimizer.step()
+        for idx in range(self.num_q):
+            self.qf_optimizers[idx].zero_grad()
+            bellman_errors[idx].mean().backward()
+            self.qf_optimizers[idx].step()
 
         policy_actions = policy_loss = None
         if self._n_train_steps_total % self.policy_and_target_update_period == 0:
-            policy_actions = self.policy(obs)
-            policy_actions.retain_grad()
-            q_output = self.qf1(obs, policy_actions)
-            policy_loss = - q_output.mean()
+            """
+            Compute the gradient of taking different variables 
+            """
 
-            self.policy_optimizer.zero_grad()
-            policy_loss.backward()
-            self.policy_optimizer.step()
+            ensemble_q_grads = []
+            ensemble_j_grads = []
+
+            for idx in range(self.num_q):
+
+                policy_actions = self.policy(obs)
+                policy_actions.retain_grad()
+
+                q_output = self.qfs[idx](obs, policy_actions)
+                policy_loss = - q_output.mean()
+
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+
+                ensemble_q_grads.append(torch.mean(policy_actions.grad,0).view(1,-1))
+
+                all_grad = torch.cat([(torch.squeeze(param.grad.view(1,-1))).view(1,-1) for param in self.policy.parameters()],dim=1)
+                ensemble_j_grads.append(all_grad)
+
+            ensemble_q_grads = torch.cat(ensemble_q_grads)
+            ensemble_j_grads = torch.cat(ensemble_j_grads)
+            var_q_grads = ensemble_q_grads.std(dim=0) ** 2
+            var_j_grads = ensemble_j_grads.std(dim=0) ** 2
+
+            var_q_grad_sum = torch.sum(var_q_grads)
+            var_j_grad_sum = torch.sum(var_j_grads)
+            print(ensemble_q_grads.size())
+            print(ensemble_j_grads.size())
+            print(var_q_grads.size())
+            print(var_j_grads.size())
+            print(var_q_grad_sum.size())
+            print(var_j_grad_sum.size())
+
 
             ptu.soft_update_from_to(self.policy, self.target_policy, self.tau)
-            ptu.soft_update_from_to(self.qf1, self.target_qf1, self.tau)
-            ptu.soft_update_from_to(self.qf2, self.target_qf2, self.tau)
+
+            for idx in range(self.num_q):
+                ptu.soft_update_from_to(self.qfs[idx], self.target_qfs[idx], self.tau)
 
         if self.eval_statistics is None:
             """
             Eval should set this to None.
             This way, these statistics are only computed for one batch.
             """
+            exit(0)
+
             if policy_loss is None:
                 policy_actions = self.policy(obs)
                 q_output = self.qf1(obs, policy_actions)
@@ -184,8 +218,7 @@ class TD3(TorchRLAlgorithm):
     def get_epoch_snapshot(self, epoch):
         snapshot = super().get_epoch_snapshot(epoch)
         snapshot.update(
-            qf1=self.qf1,
-            qf2=self.qf2,
+            qfs=self.qfs,
             policy=self.eval_policy,
             trained_policy=self.policy,
             target_policy=self.target_policy,
@@ -209,9 +242,62 @@ class TD3(TorchRLAlgorithm):
     def networks(self):
         return [
             self.policy,
-            self.qf1,
-            self.qf2,
-            self.target_policy,
-            self.target_qf1,
-            self.target_qf2,
-        ]
+            self.target_policy
+        ] + self.qfs + self.target_qfs
+
+    """
+    For variance test 
+    """
+
+
+    def train_online(self, start_epoch=0):
+        self._current_path_builder = PathBuilder()
+        observation = self._start_new_rollout()
+        for epoch in gt.timed_for(
+                range(start_epoch, self.num_epochs),
+                save_itrs=True,
+        ):
+            self._start_epoch(epoch)
+            for _ in range(self.num_env_steps_per_epoch):
+                action, agent_info = self._get_action_and_info(
+                    observation,
+                )
+                if self.render:
+                    self.training_env.render()
+                next_ob, raw_reward, terminal, env_info = (
+                    self.training_env.step(action)
+                )
+                self._n_env_steps_total += 1
+                reward = raw_reward * self.reward_scale
+                terminal = np.array([terminal])
+                reward = np.array([reward])
+                self._handle_step(
+                    observation,
+                    action,
+                    reward,
+                    next_ob,
+                    terminal,
+                    agent_info=agent_info,
+                    env_info=env_info,
+                )
+                if terminal or len(self._current_path_builder) >= self.max_path_length:
+                    self._handle_rollout_ending()
+                    observation = self._start_new_rollout()
+                else:
+                    observation = next_ob
+
+                gt.stamp('sample')
+                self._try_to_train()
+                gt.stamp('train')
+
+            self._try_to_eval(epoch)
+            gt.stamp('eval')
+            self._end_epoch()
+
+    def _try_to_train(self):
+        if self._can_train():
+            self.training_mode(True)
+            for i in range(self.num_updates_per_train_call):
+                self._do_training()
+                self._n_train_steps_total += 1
+            self.training_mode(False)
