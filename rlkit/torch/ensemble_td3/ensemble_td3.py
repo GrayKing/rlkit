@@ -1,27 +1,20 @@
-from collections import OrderedDict
-
-import numpy as np
 import torch
 import torch.optim as optim
 from torch import nn as nn
 
-import rlkit.torch.pytorch_util as ptu
 from rlkit.core.eval_util import create_stats_ordered_dict
 from rlkit.torch.torch_rl_algorithm import TorchRLAlgorithm
 
 
-import abc
-import pickle
-import time
-
 import gtimer as gt
-import numpy as np
-
-from rlkit.core import logger
-from rlkit.data_management.env_replay_buffer import EnvReplayBuffer
 from rlkit.data_management.path_builder import PathBuilder
-from rlkit.policies.base import ExplorationPolicy
-from rlkit.samplers.in_place import InPlacePathSampler
+
+from collections import OrderedDict
+
+import numpy as np
+import rlkit.core.eval_util
+from rlkit.torch import pytorch_util as ptu
+from rlkit.core import logger, eval_util
 
 class EnsembleTD3(TorchRLAlgorithm):
     """
@@ -98,6 +91,7 @@ class EnsembleTD3(TorchRLAlgorithm):
         Critic operations.
         """
 
+        # add some gaussian noise
         next_actions = self.target_policy(next_obs)
         noise = torch.normal(
             torch.zeros_like(next_actions),
@@ -109,7 +103,6 @@ class EnsembleTD3(TorchRLAlgorithm):
             self.target_policy_noise_clip
         )
         noisy_next_actions = next_actions + noise
-
 
         bellman_errors = []
         for idx in range(self.num_q):
@@ -128,47 +121,23 @@ class EnsembleTD3(TorchRLAlgorithm):
             self.qf_optimizers[idx].step()
 
         policy_actions = policy_loss = None
+        var_q_grad_sum = None
         if self._n_train_steps_total % self.policy_and_target_update_period == 0:
             """
-            Compute the gradient of taking different variables 
+            update target network 
             """
 
-            ensemble_q_grads = []
-            ensemble_j_grads = []
+            policy_actions = self.policy(obs)
+            policy_actions.retain_grad()
+            q_output = self.qfs[0](obs, policy_actions)
+            policy_loss = - q_output.mean()
 
-            for idx in range(self.num_q):
-
-                policy_actions = self.policy(obs)
-                policy_actions.retain_grad()
-
-                q_output = self.qfs[idx](obs, policy_actions)
-                policy_loss = - q_output.mean()
-
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-
-                ensemble_q_grads.append(torch.mean(policy_actions.grad,0).view(1,-1))
-
-                all_grad = torch.cat([(torch.squeeze(param.grad.view(1,-1))).view(1,-1) for param in self.policy.parameters()],dim=1)
-                ensemble_j_grads.append(all_grad)
-
-            ensemble_q_grads = torch.cat(ensemble_q_grads)
-            ensemble_j_grads = torch.cat(ensemble_j_grads)
-            var_q_grads = ensemble_q_grads.std(dim=0) ** 2
-            var_j_grads = ensemble_j_grads.std(dim=0) ** 2
-
-            var_q_grad_sum = torch.sum(var_q_grads)
-            var_j_grad_sum = torch.sum(var_j_grads)
-            print(ensemble_q_grads.size())
-            print(ensemble_j_grads.size())
-            print(var_q_grads.size())
-            print(var_j_grads.size())
-            print(var_q_grad_sum.size())
-            print(var_j_grad_sum.size())
+            self.policy_optimizer.zero_grad()
+            policy_loss.backward()
+            self.policy_optimizer.step()
 
 
             ptu.soft_update_from_to(self.policy, self.target_policy, self.tau)
-
             for idx in range(self.num_q):
                 ptu.soft_update_from_to(self.qfs[idx], self.target_qfs[idx], self.tau)
 
@@ -177,42 +146,71 @@ class EnsembleTD3(TorchRLAlgorithm):
             Eval should set this to None.
             This way, these statistics are only computed for one batch.
             """
-            exit(0)
 
             if policy_loss is None:
+                """
+                Compute the policy loss which computed by Q-value functions 
+                """
                 policy_actions = self.policy(obs)
-                q_output = self.qf1(obs, policy_actions)
+                q_output = self.qfs[0](obs, policy_actions)
                 policy_loss = - q_output.mean()
 
+            if var_q_grad_sum is None:
+                """
+                Compute the gradient of taking different variables 
+                """
+                ensemble_q_grads = []
+                ensemble_j_grads = []
+
+                for idx in range(self.num_q):
+                    policy_actions = self.policy(obs)
+                    policy_actions.retain_grad()
+
+                    q_output = self.qfs[idx](obs, policy_actions)
+                    policy_loss = - q_output.mean()
+
+                    self.policy_optimizer.zero_grad()
+                    policy_loss.backward()
+
+                    ensemble_q_grads.append(torch.mean(policy_actions.grad, 0).view(1, -1))
+
+                    all_grad = torch.cat(
+                        [(torch.squeeze(param.grad.view(1, -1))).view(1, -1) for param in self.policy.parameters()],
+                        dim=1)
+                    ensemble_j_grads.append(all_grad)
+
+                ensemble_q_grads = torch.cat(ensemble_q_grads)
+                ensemble_j_grads = torch.cat(ensemble_j_grads)
+
+                average_g_grads = torch.mean(ensemble_q_grads,dim=0)
+                average_j_grads = torch.mean(ensemble_j_grads,dim=0)
+
+                average_g_grad_norm = torch.norm(average_g_grads,p=2)
+                average_j_grad_norm = torch.norm(average_j_grads,p=2)
+
+                var_q_grads = ensemble_q_grads.std(dim=0) ** 2
+                var_j_grads = ensemble_j_grads.std(dim=0) ** 2
+
+                var_q_grad_sum = torch.sum(var_q_grads)
+                var_j_grad_sum = torch.sum(var_j_grads)
+
+
             self.eval_statistics = OrderedDict()
-            self.eval_statistics['QF1 Loss'] = np.mean(ptu.get_numpy(qf1_loss))
-            self.eval_statistics['QF2 Loss'] = np.mean(ptu.get_numpy(qf2_loss))
             self.eval_statistics['Policy Loss'] = np.mean(ptu.get_numpy(
                 policy_loss
             ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Q1 Predictions',
-                ptu.get_numpy(q1_pred),
+
+            self.eval_statistics['Analysis: Var Q gradients'] = np.mean(ptu.get_numpy(
+                var_q_grad_sum
             ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Q2 Predictions',
-                ptu.get_numpy(q2_pred),
+            self.eval_statistics['Analysis: Var J gradients'] = np.mean(ptu.get_numpy(
+                var_j_grad_sum
             ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Q Targets',
-                ptu.get_numpy(q_target),
+            self.eval_statistics['Analysis: Mean Q grad norm'] = np.mean(ptu.get_numpy(
+                average_g_grad_norm
             ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Bellman Errors 1',
-                ptu.get_numpy(bellman_errors_1),
-            ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Bellman Errors 2',
-                ptu.get_numpy(bellman_errors_2),
-            ))
-            self.eval_statistics.update(create_stats_ordered_dict(
-                'Policy Action',
-                ptu.get_numpy(policy_actions),
+            self.eval_statistics['Analysis: Mean J grad norm'] = np.mean(ptu.get_numpy(
+                average_j_grad_norm
             ))
 
     def get_epoch_snapshot(self, epoch):
@@ -301,3 +299,36 @@ class EnsembleTD3(TorchRLAlgorithm):
                 self._do_training()
                 self._n_train_steps_total += 1
             self.training_mode(False)
+
+    """
+    Optional cancel too much screen logging information 
+    
+    """
+
+    def evaluate(self, epoch):
+        statistics = OrderedDict()
+        statistics.update(self.eval_statistics)
+        self.eval_statistics = None
+
+        logger.log("Collecting samples for evaluation")
+        test_paths = self.eval_sampler.obtain_samples()
+
+        statistics.update(eval_util.get_generic_path_information(
+            test_paths, stat_prefix="Test",
+        ))
+        statistics.update(eval_util.get_generic_path_information(
+            self._exploration_paths, stat_prefix="Exploration",
+        ))
+        if hasattr(self.env, "log_diagnostics"):
+            self.env.log_diagnostics(test_paths)
+
+        average_returns = rlkit.core.eval_util.get_average_returns(test_paths)
+        statistics['AverageReturn'] = average_returns
+        for key, value in statistics.items():
+            logger.record_tabular(key, value)
+
+        if self.render_eval_paths:
+            self.env.render_paths(test_paths)
+
+        if self.plotter:
+            self.plotter.draw()
