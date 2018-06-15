@@ -40,7 +40,8 @@ class EnsembleTD3(TorchRLAlgorithm):
             tau=0.005,
             qf_criterion=None,
             optimizer_class=optim.Adam,
-
+            stop_actor_training = None,
+            stop_critic_training = None,
             **kwargs
     ):
         super().__init__(
@@ -79,6 +80,9 @@ class EnsembleTD3(TorchRLAlgorithm):
         )
         self.eval_statistics = None
 
+        self.stop_actor_training = stop_actor_training
+        self.stop_critic_training = stop_critic_training
+
     def _do_training(self):
         batch = self.get_batch()
         rewards = batch['rewards']
@@ -105,20 +109,23 @@ class EnsembleTD3(TorchRLAlgorithm):
         noisy_next_actions = next_actions + noise
 
         bellman_errors = []
-        for idx in range(self.num_q):
-            target_q_values = self.target_qfs[idx](next_obs, noisy_next_actions)
-            q_target = rewards + (1. - terminals) * self.discount * target_q_values
-            q_target = q_target.detach()
-            q_pred = self.qfs[idx](obs, actions)
-            bellman_errors.append( (q_pred - q_target) ** 2)
+        if self.stop_critic_training is None or self.stop_critic_training >= self.current_epoch:
+
+            for idx in range(self.num_q):
+                target_q_values = self.target_qfs[idx](next_obs, noisy_next_actions)
+                q_target = rewards + (1. - terminals) * self.discount * target_q_values
+                q_target = q_target.detach()
+                q_pred = self.qfs[idx](obs, actions)
+                bellman_errors.append( (q_pred - q_target) ** 2)
 
         """
         Update Networks
         """
-        for idx in range(self.num_q):
-            self.qf_optimizers[idx].zero_grad()
-            bellman_errors[idx].mean().backward()
-            self.qf_optimizers[idx].step()
+        if self.stop_critic_training is None or self.stop_critic_training >= self.current_epoch:
+            for idx in range(self.num_q):
+                self.qf_optimizers[idx].zero_grad()
+                bellman_errors[idx].mean().backward()
+                self.qf_optimizers[idx].step()
 
         policy_actions = policy_loss = None
         var_q_grad_sum = None
@@ -126,20 +133,20 @@ class EnsembleTD3(TorchRLAlgorithm):
             """
             update target network 
             """
+            if self.stop_actor_training is None or self.stop_actor_training >= self.current_epoch:
+                policy_actions = self.policy(obs)
+                policy_actions.retain_grad()
+                q_output = self.qfs[0](obs, policy_actions)
+                policy_loss = - q_output.mean()
 
-            policy_actions = self.policy(obs)
-            policy_actions.retain_grad()
-            q_output = self.qfs[0](obs, policy_actions)
-            policy_loss = - q_output.mean()
-
-            self.policy_optimizer.zero_grad()
-            policy_loss.backward()
-            self.policy_optimizer.step()
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+                self.policy_optimizer.step()
 
 
-            ptu.soft_update_from_to(self.policy, self.target_policy, self.tau)
-            for idx in range(self.num_q):
-                ptu.soft_update_from_to(self.qfs[idx], self.target_qfs[idx], self.tau)
+                ptu.soft_update_from_to(self.policy, self.target_policy, self.tau)
+                for idx in range(self.num_q):
+                    ptu.soft_update_from_to(self.qfs[idx], self.target_qfs[idx], self.tau)
 
         if self.eval_statistics is None:
             """
@@ -244,18 +251,19 @@ class EnsembleTD3(TorchRLAlgorithm):
         ] + self.qfs + self.target_qfs
 
     """
-    For variance test 
+    rewrite training wrapper for intermediate stop mechanism 
     """
-
 
     def train_online(self, start_epoch=0):
         self._current_path_builder = PathBuilder()
         observation = self._start_new_rollout()
+        self.current_epoch = 0
         for epoch in gt.timed_for(
                 range(start_epoch, self.num_epochs),
                 save_itrs=True,
         ):
             self._start_epoch(epoch)
+            self.current_epoch = epoch
             for _ in range(self.num_env_steps_per_epoch):
                 action, agent_info = self._get_action_and_info(
                     observation,
@@ -299,6 +307,9 @@ class EnsembleTD3(TorchRLAlgorithm):
                 self._do_training()
                 self._n_train_steps_total += 1
             self.training_mode(False)
+        # else:
+        #     print("Cannot train, please check condition")
+
 
     """
     Optional cancel too much screen logging information 

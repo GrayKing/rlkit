@@ -17,7 +17,7 @@ from rlkit.exploration_strategies.gaussian_strategy import GaussianStrategy
 from rlkit.launchers.launcher_util import setup_logger
 from rlkit.torch.networks import FlattenMlp, TanhMlpPolicy
 from rlkit.torch.ensemble_td3.ensemble_td3 import EnsembleTD3
-
+from rlkit.torch.ddpg.ddpg import DDPG
 
 def experiment(variant,env=None):
     if env is None:
@@ -50,12 +50,12 @@ def experiment(variant,env=None):
         exploration_strategy=es,
         policy=policy,
     )
-    algorithm = EnsembleTD3(
+    algorithm = DDPG(
         env,
-        qfs=[qf1,qf2],
+        qf=qf1,
         policy=policy,
         exploration_policy=exploration_policy,
-        **variant['algo_kwargs']
+        **variant['algo_params']
     )
     if ptu.gpu_enabled():
         algorithm.cuda()
@@ -65,20 +65,20 @@ def experiment(variant,env=None):
 if __name__ == "__main__":
     env = NormalizedBoxEnv(InvertedPendulumEnv())
     variant = dict(
-        algo_kwargs=dict(
+        algo_params=dict(
             num_epochs=1000,
             num_steps_per_epoch=1000,
-            num_steps_per_eval=10000,
-            max_path_length=1000,
-            batch_size=100,
-            discount=0.99,
-            replay_buffer_size=int(1E6),
-            policy_and_target_update_period=1,
+            num_steps_per_eval=1000,
+            use_soft_update=True,
             tau=1e-2,
-            #stop_actor_training=1200,
+            batch_size=128,
+            max_path_length=1000,
+            discount=0.99,
+            qf_learning_rate=1e-3,
+            policy_learning_rate=1e-4,
         ),
     )
     # setup_logger('ensemble-td3-test02-normal-july-13-experiment', variant=variant)
     # setup_logger('test', variant=variant)
-    setup_logger('test-InvertPendulum', variant=variant)
+    setup_logger('comparison-test-InvertPendulum', variant=variant)
     experiment(variant,env=env)
