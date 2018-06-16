@@ -321,6 +321,7 @@ class EnsembleTD3(TorchRLAlgorithm):
         statistics.update(self.eval_statistics)
         self.eval_statistics = None
 
+
         logger.log("Collecting samples for evaluation")
         test_paths = self.eval_sampler.obtain_samples()
 

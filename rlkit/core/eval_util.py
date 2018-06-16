@@ -17,9 +17,11 @@ def get_generic_path_information(paths, stat_prefix=''):
 
     rewards = np.vstack([path["rewards"] for path in paths])
     statistics.update(create_stats_ordered_dict('Rewards', rewards,
-                                                stat_prefix=stat_prefix))
+                                                stat_prefix=stat_prefix,
+                                                always_show_all_stats=True))
     statistics.update(create_stats_ordered_dict('Returns', returns,
-                                                stat_prefix=stat_prefix))
+                                                stat_prefix=stat_prefix,
+                                                always_show_all_stats=True))
     actions = [path["actions"] for path in paths]
     if len(actions[0].shape) == 1:
         actions = np.hstack([path["actions"] for path in paths])
